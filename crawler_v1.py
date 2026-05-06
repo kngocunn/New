@@ -36,10 +36,14 @@ CSV_PATH   = "data/doanh_nghiep.csv"
 EXCEL_PATH = "data/doanh_nghiep.xlsx"
 CKPT_PATH  = "data/checkpoint.csv"
 
-CHAY_HA_NOI = True
-CHAY_HCM    = True
+CHAY_HA_NOI = False 
+CHAY_HCM    = False
 TARGET      = 500
 CO_ENRICH   = True
+
+# Trang bắt đầu cho mỗi tỉnh (1 = từ đầu)
+START_PAGE  = {"ha-noi": 1, "ho-chi-minh": 1}
+LISTING_PATH = "data/listing.csv"   # lưu kết quả listing trước khi enrich
 
 # ─── Browser ─────────────────────────────────────────────────────────────────
 
@@ -243,6 +247,18 @@ def parse_detail(html: str) -> dict:
 
 # ─── Crawl ───────────────────────────────────────────────────────────────────
 
+def _append_listing(new_records: list):
+    """Ghi thêm records mới vào LISTING_PATH, dedup theo MST."""
+    df_new = pd.DataFrame(new_records)
+    if os.path.exists(LISTING_PATH):
+        df_old = pd.read_csv(LISTING_PATH, dtype=str).fillna("")
+        df = pd.concat([df_old, df_new], ignore_index=True)
+    else:
+        df = df_new
+    df.drop_duplicates(subset=["ma_so_thue"], keep="last", inplace=True)
+    df.to_csv(LISTING_PATH, index=False, encoding="utf-8-sig")
+
+
 def get_listing_url(tinh_key: str, page_num: int) -> str:
     base = TINH_URL[tinh_key]
     return f"{BASE_URL}{base}" if page_num == 1 else f"{BASE_URL}{base}/page-{page_num}"
@@ -251,10 +267,10 @@ def get_listing_url(tinh_key: str, page_num: int) -> str:
 def crawl_listing(tinh_key: str, tinh_label: str, max_records: int = 500) -> list:
     all_records = []
     seen_mst    = set()
-    page_num    = 1
+    page_num    = START_PAGE.get(tinh_key, 1)
     empty_pages = 0
 
-    log.info(f"=== Crawl listing: {tinh_label} | muc tieu: {max_records} ===")
+    log.info(f"=== Crawl listing: {tinh_label} | tu trang {page_num} | muc tieu: {max_records} ===")
 
     while len(all_records) < max_records:
         url  = get_listing_url(tinh_key, page_num)
@@ -265,16 +281,21 @@ def crawl_listing(tinh_key: str, tinh_label: str, max_records: int = 500) -> lis
 
         records   = parse_listing(html, tinh_label)
         new_count = 0
+        new_batch = []
         for r in records:
             if r["ma_so_thue"] not in seen_mst and len(all_records) < max_records:
                 seen_mst.add(r["ma_so_thue"])
                 all_records.append(r)
+                new_batch.append(r)
                 new_count += 1
 
         log.info(
             f"  [{tinh_label}] trang {page_num:>4}: +{new_count:>2}"
             f" | tong {len(all_records):>5}/{max_records}"
         )
+
+        if new_count > 0:
+            _append_listing(new_batch)
 
         if new_count == 0:
             empty_pages += 1
@@ -295,18 +316,31 @@ def crawl_listing(tinh_key: str, tinh_label: str, max_records: int = 500) -> lis
 
 
 def enrich_records(records: list, batch_size: int = 50) -> list:
-    enriched_mst = set()
+    # Nếu không có records trong memory, load từ file có sẵn
+    if not records:
+        for src in [LISTING_PATH, CKPT_PATH, CSV_PATH]:
+            if os.path.exists(src):
+                records = pd.read_csv(src, dtype=str).fillna("").to_dict("records")
+                log.info(f"Load {len(records)} records tu {src}")
+                break
+
+    ENRICH_FIELDS = ["so_dien_thoai", "email", "nam_thanh_lap", "nganh_nghe"]
+    enriched_mst  = set()
     if os.path.exists(CKPT_PATH):
-        df_cp        = pd.read_csv(CKPT_PATH, dtype=str).fillna("")
-        enriched_mst = set(df_cp["ma_so_thue"].tolist())
-        ckpt_map     = df_cp.set_index("ma_so_thue").to_dict("index")
+        df_cp    = pd.read_csv(CKPT_PATH, dtype=str).fillna("")
+        ckpt_map = df_cp.set_index("ma_so_thue").to_dict("index")
+        # Chỉ bỏ qua record đã có ít nhất 1 trường enrich
+        has_data = df_cp[ENRICH_FIELDS].apply(
+            lambda row: any(str(v).strip() for v in row), axis=1
+        )
+        enriched_mst = set(df_cp[has_data]["ma_so_thue"].tolist())
         for r in records:
             if r["ma_so_thue"] in ckpt_map:
-                for k in ("so_dien_thoai", "email", "nam_thanh_lap", "nganh_nghe"):
+                for k in ENRICH_FIELDS:
                     v = ckpt_map[r["ma_so_thue"]].get(k, "")
                     if v:
                         r[k] = v
-        log.info(f"Checkpoint: {len(enriched_mst)} da enrich")
+        log.info(f"Checkpoint: {len(enriched_mst)} da co du lieu, {len(ckpt_map)-len(enriched_mst)} se thu lai")
 
     total = len(records)
     log.info(f"=== Enrich {total} records ===")
@@ -394,8 +428,11 @@ try:
         tat_ca.extend(crawl_listing("ha-noi",      "Ha Noi", max_records=TARGET))
     if CHAY_HCM:
         tat_ca.extend(crawl_listing("ho-chi-minh", "TP.HCM", max_records=TARGET))
-    if CO_ENRICH and tat_ca:
+
+    if CO_ENRICH:
+        # Enrich dùng file listing (bao gồm cả records từ các lần chạy trước)
         tat_ca = enrich_records(tat_ca, batch_size=50)
+
     if tat_ca:
         save_and_merge(tat_ca)
     else:
