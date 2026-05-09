@@ -1,12 +1,12 @@
 """
-crawler_v3.py — dùng DrissionPage (kết nối Chrome thật, vượt CF tốt hơn Playwright)
+crawler_v1.py — dùng DrissionPage (kết nối Chrome thật, vượt CF tốt hơn Playwright)
 Cài: pip install DrissionPage
-Chạy: python crawler_v3.py
+Chạy: python crawler_v1.py
 """
 
-import re, os, sys, time, random, logging
+import re, os, sys, time, random, logging, signal, json
+from threading import Lock, Event
 from datetime import datetime
-from unidecode import unidecode
 import pandas as pd
 from bs4 import BeautifulSoup
 from DrissionPage import ChromiumPage, ChromiumOptions
@@ -34,16 +34,68 @@ DELAY_MAX  = 3.0
 os.makedirs("data", exist_ok=True)
 CSV_PATH   = "data/doanh_nghiep.csv"
 EXCEL_PATH = "data/doanh_nghiep.xlsx"
-CKPT_PATH  = "data/checkpoint.csv"
 
-CHAY_HA_NOI = False 
-CHAY_HCM    = False
-TARGET      = 500
-CO_ENRICH   = True
+CHAY_HA_NOI = True
+CHAY_HCM    = True
+TARGET      = 15000
 
-# Trang bắt đầu cho mỗi tỉnh (1 = từ đầu)
-START_PAGE  = {"ha-noi": 1, "ho-chi-minh": 1}
-LISTING_PATH = "data/listing.csv"   # lưu kết quả listing trước khi enrich
+# Trang bắt đầu crawl listing (1 = từ đầu / theo checkpoint)
+START_HA_NOI = 117
+START_HCM    = 1
+
+START_PAGE     = {"ha-noi": START_HA_NOI, "ho-chi-minh": START_HCM}
+LISTING_PATH   = "data/listing.csv"
+PAGE_CKPT_PATH = "data/page_checkpoint.json"
+
+FREEZE_AFTER = 5  # số lần thất bại liên tiếp trước khi đóng băng chờ đổi IP
+
+# ─── Stop flag ───────────────────────────────────────────────────────────────
+
+_STOP        = Event()
+_FROZEN      = Event()
+_freeze_lock = Lock()
+
+
+def _handle_sigint(sig, frame):
+    if not _STOP.is_set():
+        print("\n" + "=" * 60)
+        print("  [!] Nhan Ctrl+C — se dung sau record hien tai...")
+        print("  [!] Nhan Ctrl+C lan 2 de THOAT NGAY.")
+        print("=" * 60 + "\n")
+        _STOP.set()
+        _FROZEN.clear()
+    else:
+        print("\n[!] Buoc dung ngay!")
+        sys.exit(1)
+
+signal.signal(signal.SIGINT, _handle_sigint)
+
+
+def _freeze_and_wait(reason: str = ""):
+    """Đóng băng toàn bộ crawl, chờ người dùng đổi IP rồi nhấn Enter."""
+    with _freeze_lock:
+        if _FROZEN.is_set():
+            return
+        _FROZEN.set()
+        print("\n" + "=" * 60)
+        print(f"  [FROZEN] {reason}")
+        print("  Crawl da DONG BANG hoan toan.")
+        print("  Hay doi IP, sau do nhan ENTER de tiep tuc...")
+        print("  (Nhan Ctrl+C de dung han)")
+        print("=" * 60)
+        try:
+            input("  >> Nhan ENTER sau khi doi IP xong: ")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        _FROZEN.clear()
+
+
+def _wait_if_frozen():
+    """Nếu đang đóng băng, block cho đến khi được giải phóng."""
+    if _FROZEN.is_set():
+        log.info("  [Thread] Dang cho frozen duoc giai phong...")
+        while _FROZEN.is_set() and not _STOP.is_set():
+            time.sleep(1)
 
 # ─── Browser ─────────────────────────────────────────────────────────────────
 
@@ -60,7 +112,6 @@ def get_browser() -> ChromiumPage:
     co.set_argument("--no-sandbox")
     co.set_argument("--disable-blink-features=AutomationControlled")
     co.set_argument("--lang=vi-VN")
-    # headless=False (mặc định) để user giải CF nếu cần
     _page = ChromiumPage(co)
     return _page
 
@@ -82,74 +133,96 @@ def fetch_html(url: str, wait_selector: str = "ul.hsdn",
     """
     Điều hướng đến url, chờ wait_selector xuất hiện (tối đa timeout giây).
     Nếu CF hiện: in thông báo, chờ user giải, tự động tiếp tục.
+    Nếu thất bại: retry vô hạn cho đến khi thành công hoặc _STOP được set.
     """
     br = get_browser()
+    attempt = 0
 
-    try:
-        br.get(url)
-    except Exception as e:
-        log.error(f"Loi navigate [{url}]: {e}")
-        return None
-
-    t0      = time.time()
-    warned  = False
-
-    while True:
-        # Kiểm tra selector đã xuất hiện chưa
-        el = br.ele(f"css:{wait_selector}", timeout=0)
-        if el:
-            html = br.html
-            time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-            return html
-
-        elapsed = time.time() - t0
-        if elapsed > timeout:
-            log.error(f"Timeout {timeout}s: [{url}] — khong tim thay {wait_selector!r}")
+    while not _STOP.is_set():
+        _wait_if_frozen()
+        if _STOP.is_set():
             return None
 
-        # Cảnh báo nếu chờ lâu (có thể đang bị CF)
-        if not warned and elapsed > 8:
-            title = ""
-            try:
-                title = br.title
-            except Exception:
-                pass
-            is_cf = any(s in title for s in ("Just a moment", "Verify", "Checking"))
-            print("\n" + "=" * 60)
-            print(f"  Chua co du lieu sau {elapsed:.0f}s  |  title: {title!r}")
-            if is_cf:
-                print("  CLOUDFLARE CHALLENGE — hay giai xac thuc trong Chrome")
-            else:
-                print("  Trang chua tai xong hoac bi chan — kiem tra cua so Chrome")
-            print("  Script se TU DONG TIEP TUC sau khi du lieu xuat hien")
-            print("=" * 60 + "\n")
-            warned = True
+        attempt += 1
+        if attempt > FREEZE_AFTER:
+            _freeze_and_wait(
+                f"Chrome that bai {attempt - 1} lan lien tiep — IP co the bi chan hoan toan\n"
+                f"  URL: {url[:80]}"
+            )
+            attempt = 1
+            continue
 
-        time.sleep(1.5)
+        try:
+            br.get(url)
+            attempt = 1
+        except Exception as e:
+            log.error(f"Loi navigate [{url}]: {e}")
+            if _STOP.is_set():
+                return None
+            wait = min(5 * attempt, 30)
+            log.info(f"  Thu lai lan {attempt} sau {wait}s (co the dang doi IP)...")
+            time.sleep(wait)
+            continue
+
+        t0     = time.time()
+        warned = False
+
+        while not _STOP.is_set():
+            el = br.ele(f"css:{wait_selector}", timeout=0)
+            if el:
+                html = br.html
+                time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+                return html
+
+            elapsed = time.time() - t0
+            if elapsed > timeout:
+                title = ""
+                try:
+                    title = br.title
+                except Exception:
+                    pass
+                is_cf = any(s in title for s in ("Just a moment", "Verify", "Checking", "Attention Required"))
+                if is_cf:
+                    log.warning(f"CF block sau {timeout}s (lan {attempt}): [{url}] — se thu lai...")
+                    break
+                else:
+                    log.info(f"Timeout {timeout}s: [{url}] — khong co {wait_selector!r}, tra ve html de xu ly")
+                    html = br.html
+                    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+                    return html
+
+            if not warned and elapsed > 8:
+                title = ""
+                try:
+                    title = br.title
+                except Exception:
+                    pass
+                is_cf = any(s in title for s in ("Just a moment", "Verify", "Checking", "Attention Required"))
+                print("\n" + "=" * 60)
+                print(f"  Chua co du lieu sau {elapsed:.0f}s  |  title: {title!r}")
+                if is_cf:
+                    print("  CLOUDFLARE CHALLENGE — hay giai xac thuc trong Chrome")
+                else:
+                    print("  Trang chua tai xong hoac bi chan — kiem tra cua so Chrome")
+                print("  Script se TU DONG TIEP TUC sau khi du lieu xuat hien")
+                print("  (Nhan Ctrl+C de dung gracefully, Ctrl+C x2 de thoat ngay)")
+                print("=" * 60 + "\n")
+                warned = True
+
+            time.sleep(1.5)
+
+        if not _STOP.is_set():
+            wait = min(random.uniform(5, 10) * attempt, 60)
+            log.info(f"  Thu lai lan {attempt + 1} sau {wait:.1f}s... [{url[:60]}]")
+            time.sleep(wait)
+
+    return None
 
 
 # ─── Parse listing ───────────────────────────────────────────────────────────
 
-def normalize_phone(phone: str) -> str:
-    if not phone:
-        return ""
-    d = re.sub(r"\D", "", phone)
-    if d.startswith("84") and len(d) == 11:
-        d = "0" + d[2:]
-    return d if len(d) in (9, 10) and d.startswith("0") else phone.strip()
-
-
 def normalize_address(raw: str) -> str:
     return " ".join(raw.split()).replace(" ,", ",") if raw else ""
-
-
-def decode_cf_email(encoded: str) -> str:
-    try:
-        enc = bytes.fromhex(encoded)
-        key = enc[0]
-        return "".join(chr(b ^ key) for b in enc[1:]).lower().strip()
-    except Exception:
-        return ""
 
 
 def parse_listing(html: str, tinh_label: str) -> list:
@@ -203,49 +276,24 @@ def parse_listing(html: str, tinh_label: str) -> list:
     return records
 
 
-# ─── Parse detail ─────────────────────────────────────────────────────────────
-
-def parse_detail(html: str) -> dict:
-    soup   = BeautifulSoup(html, "html.parser")
-    result = {"so_dien_thoai": "", "email": "", "nam_thanh_lap": "", "nganh_nghe": ""}
-
-    scope = soup.find("div", class_=lambda c: c and "detail" in c) or soup
-
-    for ul in scope.find_all("ul", class_="hsct"):
-        for li in ul.find_all("li"):
-            li_str = str(li)
-            for icon in li.find_all("i"):
-                icon.decompose()
-            text      = li.get_text(separator=" ", strip=True)
-            text_norm = unidecode(text).lower()
-
-            if "fa-phone" in li_str or "dien thoai" in text_norm:
-                nums = re.findall(r"0\d{8,9}", text)
-                if nums and not result["so_dien_thoai"]:
-                    result["so_dien_thoai"] = normalize_phone(nums[0])
-
-            elif "fa-envelope" in li_str or "email" in text_norm:
-                cf_tag = li.find(class_="__cf_email__")
-                if cf_tag and cf_tag.get("data-cfemail"):
-                    result["email"] = decode_cf_email(cf_tag["data-cfemail"])
-                else:
-                    emails = re.findall(r"[\w.+-]+@[\w-]+\.[\w.]+", text)
-                    if emails and not result["email"]:
-                        result["email"] = emails[0].lower()
-
-            elif "fa-calendar" in li_str or "ngay cap" in text_norm or "ngay thanh lap" in text_norm:
-                years = re.findall(r"\b(?:19|20)\d{2}\b", text)
-                if years and not result["nam_thanh_lap"]:
-                    result["nam_thanh_lap"] = years[0]
-
-            elif "fa-tags" in li_str or "nganh nghe" in text_norm or "linh vuc" in text_norm:
-                if ":" in text and not result["nganh_nghe"]:
-                    result["nganh_nghe"] = text.split(":", 1)[1].strip()
-
-    return result
-
-
 # ─── Crawl ───────────────────────────────────────────────────────────────────
+
+def _load_page_ckpt() -> dict:
+    if os.path.exists(PAGE_CKPT_PATH):
+        try:
+            with open(PAGE_CKPT_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_page_ckpt(tinh_key: str, page_num: int):
+    data = _load_page_ckpt()
+    data[tinh_key] = page_num
+    with open(PAGE_CKPT_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
 
 def _append_listing(new_records: list):
     """Ghi thêm records mới vào LISTING_PATH, dedup theo MST."""
@@ -267,19 +315,46 @@ def get_listing_url(tinh_key: str, page_num: int) -> str:
 def crawl_listing(tinh_key: str, tinh_label: str, max_records: int = 500) -> list:
     all_records = []
     seen_mst    = set()
-    page_num    = START_PAGE.get(tinh_key, 1)
-    empty_pages = 0
+
+    if os.path.exists(LISTING_PATH):
+        try:
+            df_ex = pd.read_csv(LISTING_PATH, dtype=str).fillna("")
+            prev  = df_ex[df_ex["tinh_thanh"] == tinh_label]
+            seen_mst    = set(prev["ma_so_thue"].tolist())
+            all_records = prev.to_dict("records")
+            if seen_mst:
+                log.info(f"  Resume listing {tinh_label}: da co {len(seen_mst)} MST tu file cu")
+        except Exception as e:
+            log.warning(f"  Khong load duoc listing.csv: {e}")
+
+    manual_start = START_PAGE.get(tinh_key, 1)
+    if manual_start > 1:
+        page_num = manual_start
+        log.info(f"  Bat dau tu trang {page_num} (do nguoi dung chi dinh)")
+    else:
+        page_ckpt = _load_page_ckpt()
+        if tinh_key in page_ckpt and len(seen_mst) > 0:
+            page_num = page_ckpt[tinh_key]
+            log.info(f"  Resume tu trang {page_num} (checkpoint tu lan chay truoc)")
+        else:
+            page_num = 1
 
     log.info(f"=== Crawl listing: {tinh_label} | tu trang {page_num} | muc tieu: {max_records} ===")
 
-    while len(all_records) < max_records:
+    while len(all_records) < max_records and not _STOP.is_set():
         url  = get_listing_url(tinh_key, page_num)
         html = fetch_html(url, wait_selector="ul.hsdn")
         if not html:
-            log.error(f"Khong lay duoc trang {page_num}, dung.")
+            log.info(f"Dung crawl listing theo yeu cau nguoi dung.")
             break
 
-        records   = parse_listing(html, tinh_label)
+        records = parse_listing(html, tinh_label)
+
+        if not records and "hsdn" not in html:
+            log.warning(f"  [{tinh_label}] trang {page_num}: HTML khong co listing, co the load do — thu lai...")
+            time.sleep(random.uniform(5, 10))
+            continue
+
         new_count = 0
         new_batch = []
         for r in records:
@@ -297,15 +372,9 @@ def crawl_listing(tinh_key: str, tinh_label: str, max_records: int = 500) -> lis
         if new_count > 0:
             _append_listing(new_batch)
 
-        if new_count == 0:
-            empty_pages += 1
-            if empty_pages >= 2:
-                log.info("  2 trang trong lien tiep, dung.")
-                break
-        else:
-            empty_pages = 0
-
         page_num += 1
+        _save_page_ckpt(tinh_key, page_num)
+
         if page_num % 10 == 0:
             wait = random.uniform(8, 12)
             log.info(f"  Nghi {wait:.1f}s ...")
@@ -313,59 +382,6 @@ def crawl_listing(tinh_key: str, tinh_label: str, max_records: int = 500) -> lis
 
     log.info(f"Xong listing {tinh_label}: {len(all_records)} records")
     return all_records
-
-
-def enrich_records(records: list, batch_size: int = 50) -> list:
-    # Nếu không có records trong memory, load từ file có sẵn
-    if not records:
-        for src in [LISTING_PATH, CKPT_PATH, CSV_PATH]:
-            if os.path.exists(src):
-                records = pd.read_csv(src, dtype=str).fillna("").to_dict("records")
-                log.info(f"Load {len(records)} records tu {src}")
-                break
-
-    ENRICH_FIELDS = ["so_dien_thoai", "email", "nam_thanh_lap", "nganh_nghe"]
-    enriched_mst  = set()
-    if os.path.exists(CKPT_PATH):
-        df_cp    = pd.read_csv(CKPT_PATH, dtype=str).fillna("")
-        ckpt_map = df_cp.set_index("ma_so_thue").to_dict("index")
-        # Chỉ bỏ qua record đã có ít nhất 1 trường enrich
-        has_data = df_cp[ENRICH_FIELDS].apply(
-            lambda row: any(str(v).strip() for v in row), axis=1
-        )
-        enriched_mst = set(df_cp[has_data]["ma_so_thue"].tolist())
-        for r in records:
-            if r["ma_so_thue"] in ckpt_map:
-                for k in ENRICH_FIELDS:
-                    v = ckpt_map[r["ma_so_thue"]].get(k, "")
-                    if v:
-                        r[k] = v
-        log.info(f"Checkpoint: {len(enriched_mst)} da co du lieu, {len(ckpt_map)-len(enriched_mst)} se thu lai")
-
-    total = len(records)
-    log.info(f"=== Enrich {total} records ===")
-
-    for i, r in enumerate(records):
-        done = i + 1
-        if r["ma_so_thue"] in enriched_mst:
-            continue
-
-        href = r.get("detail_href", "")
-        if href:
-            html = fetch_html(f"{BASE_URL}/{href}", wait_selector="ul.hsct")
-            if html:
-                r.update(parse_detail(html))
-        else:
-            log.warning(f"Khong co href: {r['ma_so_thue']}")
-
-        if done % 10 == 0 or done == total:
-            sdt_ok = sum(1 for x in records[:done] if x.get("so_dien_thoai"))
-            log.info(f"  Enrich {done}/{total} ({done/total*100:.0f}%) | SDT: {sdt_ok}")
-
-        if done % batch_size == 0 or done == total:
-            pd.DataFrame(records).to_csv(CKPT_PATH, index=False, encoding="utf-8-sig")
-
-    return records
 
 
 COLS = [
@@ -428,10 +444,6 @@ try:
         tat_ca.extend(crawl_listing("ha-noi",      "Ha Noi", max_records=TARGET))
     if CHAY_HCM:
         tat_ca.extend(crawl_listing("ho-chi-minh", "TP.HCM", max_records=TARGET))
-
-    if CO_ENRICH:
-        # Enrich dùng file listing (bao gồm cả records từ các lần chạy trước)
-        tat_ca = enrich_records(tat_ca, batch_size=50)
 
     if tat_ca:
         save_and_merge(tat_ca)
